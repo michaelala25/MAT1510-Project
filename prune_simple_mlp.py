@@ -41,7 +41,7 @@ class Model(nn.Module):
         self.fc3 = nn.Linear(7, 5)
         self.fc4 = nn.Linear(5, 4)
         self.fc5 = nn.Linear(4, 3)
-        self.fc6 = nn.Linear(3, 2)
+        self.fc6 = nn.Linear(3, 3)
 
     def forward(self, x):
         h1 = torch.tanh(self.fc1(x))
@@ -64,12 +64,14 @@ def process_dataset(dataset):
     # keep only images of two digits
     digit1 = 0
     digit2 = 2
+    digit3 = 8
 
-    indices = (dataset.targets == digit1) | (dataset.targets == digit2)
+    indices = (dataset.targets == digit1) | (dataset.targets == digit2) | (dataset.targets == digit2)
     dataset.data, dataset.targets = dataset.data[indices], dataset.targets[indices]
 
     dataset.targets[dataset.targets == digit1] = 0
     dataset.targets[dataset.targets == digit2] = 1
+    dataset.targets[dataset.targets == digit3] = 3
 
     dataset = TensorDataset(dataset.data.reshape(-1, 28*28), dataset.targets)
 
@@ -267,22 +269,22 @@ for pruning_step in range(N_prunes):
     if pruning_step == N_prunes - 1:
         break
 
-    # prune.global_unstructured(
-    #     parameters = parameters_to_prune,
-    #     pruning_method = pruning_method,
-    #     amount = prune_amount
-    # )
-    # pruning_times.append(total_epoch)
+    prune.global_unstructured(
+        parameters = parameters_to_prune,
+        pruning_method = pruning_method,
+        amount = prune_amount
+    )
+    pruning_times.append(total_epoch)
 
-    # total_num_pruned = sum(
-    #     (module.get_buffer(name + "_mask") == 0).sum().item()
-    #     for module, name in parameters_to_prune
-    # )
-    # total_num_params = sum(
-    #     module.get_parameter(name + "_orig").numel()
-    #     for module, name in parameters_to_prune
-    # )
-    # print(f"Number of pruned parameters: {total_num_pruned}/{total_num_params}")
+    total_num_pruned = sum(
+        (module.get_buffer(name + "_mask") == 0).sum().item()
+        for module, name in parameters_to_prune
+    )
+    total_num_params = sum(
+        module.get_parameter(name + "_orig").numel()
+        for module, name in parameters_to_prune
+    )
+    print(f"Number of pruned parameters: {total_num_pruned}/{total_num_params}")
 
 
 # plot results
