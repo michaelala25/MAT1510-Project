@@ -1,5 +1,6 @@
 import functools
 import math
+import cv2
 import torch
 import numpy as np
 import torch.nn as nn
@@ -17,7 +18,7 @@ from torchvision import datasets, transforms
 # hyperparameters
 device        = 'cuda'
 lr            = 7e-2
-epochs        = 10
+epochs        = 15
 milestones    = [epochs//2]
 gamma         = 0.5
 batch_size    = 512
@@ -26,22 +27,28 @@ weight_decay  = 0
 n_bins        = 10
 
 # pruning parameters
-N_prunes = 10
+N_prunes = 25
 pruning_method = prune.L1Unstructured
-prune_amount = 0.3
-fine_tuning_epochs = 5
+prune_amount = 0.1
+fine_tuning_epochs = 1
 
 
 # deep network
 class Model(nn.Module):
     def __init__(self):
         super(Model, self).__init__()
-        self.fc1 = nn.Linear(12, 10)
-        self.fc2 = nn.Linear(10, 7)
-        self.fc3 = nn.Linear(7, 5)
-        self.fc4 = nn.Linear(5, 4)
-        self.fc5 = nn.Linear(4, 3)
-        self.fc6 = nn.Linear(3, 3)
+        # self.fc1 = nn.Linear(12, 10)
+        # self.fc2 = nn.Linear(10, 7)
+        # self.fc3 = nn.Linear(7, 5)
+        # self.fc4 = nn.Linear(5, 4)
+        # self.fc5 = nn.Linear(4, 3)
+        # self.fc6 = nn.Linear(3, 3)
+        self.fc1 = nn.Linear(12, 12)
+        self.fc2 = nn.Linear(12, 10)
+        self.fc3 = nn.Linear(10, 10)
+        self.fc4 = nn.Linear(10, 8)
+        self.fc5 = nn.Linear(8, 8)
+        self.fc6 = nn.Linear(8, 3)
 
     def forward(self, x):
         h1 = torch.tanh(self.fc1(x))
@@ -60,18 +67,40 @@ parameters_to_prune = [
     if isinstance(module, nn.Linear)
 ]
 
+def get_num_pruned():
+    try:
+        return sum(
+            (module.get_buffer(name + "_mask") == 0).sum().item()
+            for module, name in parameters_to_prune
+        )
+    except:
+        # Happens if we haven't started pruning yet
+        return 0
+
+def get_num_params():
+    try:
+        return sum(
+            module.get_parameter(name + "_orig").numel()
+            for module, name in parameters_to_prune
+        )
+    except:
+        # Happens if we haven't started pruning yet
+        return sum(
+            module.get_parameter(name).numel() for module, name in parameters_to_prune
+        )
+
 def process_dataset(dataset):
     # keep only images of two digits
     digit1 = 0
     digit2 = 2
     digit3 = 8
 
-    indices = (dataset.targets == digit1) | (dataset.targets == digit2) | (dataset.targets == digit2)
+    indices = (dataset.targets == digit1) | (dataset.targets == digit2) | (dataset.targets == digit3)
     dataset.data, dataset.targets = dataset.data[indices], dataset.targets[indices]
 
     dataset.targets[dataset.targets == digit1] = 0
     dataset.targets[dataset.targets == digit2] = 1
-    dataset.targets[dataset.targets == digit3] = 3
+    dataset.targets[dataset.targets == digit3] = 2
 
     dataset = TensorDataset(dataset.data.reshape(-1, 28*28), dataset.targets)
 
@@ -120,6 +149,28 @@ MI_XH = []
 MI_YH = []
 TC = []
 
+
+video_writer = cv2.VideoWriter(
+    "information_plane.mp4", 
+    cv2.VideoWriter_fourcc(*"MP4V"), 
+    3, 
+    (640, 480)
+)
+
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+fig, ax = plt.subplots()
+canvas = FigureCanvas(fig)
+scatter = ax.scatter([], [])
+plt.xlim(0, 1)  # Set x-axis limits
+plt.ylim(0, 1)  # Set y-axis limits
+
+# For drawing bar charts of the hidden layer component RMSEs
+inset_ax = inset_axes(ax, width="20%", height="20%", loc='lower right')
+inset_ax.set_xticks([])
+inset_ax.set_yticks([])
+
+
 def run_inference_and_digitize(model, images, labels, x_bins, h_bins):
     images = images.to(device) 
     h_list = model(images)
@@ -136,7 +187,7 @@ def run_inference_and_digitize(model, images, labels, x_bins, h_bins):
         h_ = np.digitize(h.cpu().detach().numpy(), bins)
         h_s.append(h_)
 
-    return x_, y_, h_s
+    return x_, y_, h_s, h_list
 
 def totuple(a):
     try:
@@ -157,11 +208,61 @@ for pruning_step in range(N_prunes):
         digitized_images = []
         digitized_labels = []
         digitized_layers = []
+        hidden_layer_lists = []
+        all_labels = []
         for images, labels in train_loader:
-            x_, y_, h_s = run_inference_and_digitize(model, images, labels, x_bins, h_bins)
+            x_, y_, h_s, h_list = run_inference_and_digitize(model, images, labels, x_bins, h_bins)
             digitized_images.append(x_)
             digitized_labels.append(y_)
             digitized_layers.append(h_s)
+
+            hidden_layer_lists.append(h_list) # we want to measure the clustering of the second hidden layer
+            all_labels.append(labels)
+
+        all_labels = torch.cat(all_labels, dim = 0)
+        layers_to_plot = [1, 2, 3, 4]
+        subplots = []
+        for layer in layers_to_plot:
+            hidden_layers = torch.cat([h[layer] for h in hidden_layer_lists], dim = 0)
+            # fit a PCA model on the hidden layers
+            pca = PCA(n_components = 2)
+            representations = pca.fit_transform(hidden_layers.cpu().detach().numpy())
+            # scale to be in the range [0, 1]
+            representations = (representations - representations.min()) / (representations.max() - representations.min())
+            # draw the scatter plot
+            ax.clear()
+            ax.set_title(f"Layer {layer} - Epoch {total_epoch+1} - {get_num_pruned()}/{get_num_params()} pruned")
+            scatter = ax.scatter(
+                representations[:, 0], 
+                representations[:, 1], 
+                c = all_labels.cpu().detach().numpy(), 
+                cmap = "tab10"
+            )
+
+            # draw bar chart
+            inset_ax.clear()
+            # calculate the rmse of each hidden layer component
+            hidden_layer_component_rmse = torch.mean(hidden_layers ** 2, dim = 0) ** 0.5
+            hidden_layer_component_rmse = list(hidden_layer_component_rmse.detach().cpu().numpy())
+            bars = inset_ax.bar(range(len(hidden_layer_component_rmse)), hidden_layer_component_rmse)
+
+            # Redraw and convert to numpy array
+            canvas.draw()
+            image = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
+            image = image.reshape(canvas.get_width_height()[::-1] + (3,))
+            image = cv2.resize(image, (640 // 2, 480 // 2))
+            subplots.append(image)
+
+        # Put the subplots in four corners of a (640, 480) image
+        frame = np.zeros((480, 640, 3), dtype = np.uint8)
+        frame[:240, :320] = subplots[0]
+        frame[:240, 320:] = subplots[1]
+        frame[240:, :320] = subplots[2]
+        frame[240:, 320:] = subplots[3]
+        video_writer.write(frame)
+        if pruning_step > 0:
+            # Write again to slow the frame rate after pruning
+            video_writer.write(frame)
 
         # next, accumulate probability densities for X, Y, H, (X, H), and (Y, H) respectively.
         p_X, p_Y = Counter(), Counter()
@@ -286,6 +387,7 @@ for pruning_step in range(N_prunes):
     )
     print(f"Number of pruned parameters: {total_num_pruned}/{total_num_params}")
 
+video_writer.release()
 
 # plot results
 plt.figure()
